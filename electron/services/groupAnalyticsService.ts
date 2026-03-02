@@ -517,21 +517,8 @@ class GroupAnalyticsService {
     const candidates = this.buildIdCandidates(usernames)
     if (candidates.length === 0) return lookup
 
-    const batchSize = 200
-    for (let i = 0; i < candidates.length; i += batchSize) {
-      const batch = candidates.slice(i, i + batchSize)
-      if (batch.length === 0) continue
-
-      const inList = batch.map((username) => `'${username.replace(/'/g, "''")}'`).join(',')
-      const sql = `
-        SELECT username, user_name, encrypt_username, encrypt_user_name, remark, nick_name, alias, local_type
-        FROM contact
-        WHERE username IN (${inList})
-      `
-      const result = await wcdbService.execQuery('contact', null, sql)
-      if (!result.success || !result.rows) continue
-
-      for (const row of result.rows as Record<string, unknown>[]) {
+    const appendContactsToLookup = (rows: Record<string, unknown>[]) => {
+      for (const row of rows) {
         const contact: GroupMemberContactInfo = {
           remark: this.pickStringField(row, ['remark', 'WCDB_CT_remark']),
           nickName: this.pickStringField(row, ['nick_name', 'nickName', 'WCDB_CT_nick_name']),
@@ -556,6 +543,26 @@ class GroupAnalyticsService {
           }
         }
       }
+    }
+
+    const batchSize = 200
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize)
+      if (batch.length === 0) continue
+
+      const inList = batch.map((username) => `'${username.replace(/'/g, "''")}'`).join(',')
+      const lightweightSql = `
+        SELECT username, user_name, encrypt_username, encrypt_user_name, remark, nick_name, alias, local_type
+        FROM contact
+        WHERE username IN (${inList})
+      `
+      let result = await wcdbService.execQuery('contact', null, lightweightSql)
+      if (!result.success || !result.rows) {
+        // 兼容历史/变体列名，轻查询失败时回退全字段查询，避免好友标识丢失
+        result = await wcdbService.execQuery('contact', null, `SELECT * FROM contact WHERE username IN (${inList})`)
+      }
+      if (!result.success || !result.rows) continue
+      appendContactsToLookup(result.rows as Record<string, unknown>[])
     }
     return lookup
   }
