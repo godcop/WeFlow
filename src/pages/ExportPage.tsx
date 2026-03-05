@@ -171,6 +171,8 @@ const SESSION_MEDIA_METRIC_BATCH_SIZE = 12
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS = 120
 const SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS = 1200
+const SNS_USER_POST_COUNT_BATCH_SIZE = 12
+const SNS_USER_POST_COUNT_BATCH_INTERVAL_MS = 120
 const contentTypeLabels: Record<ContentType, string> = {
   text: '聊天文本',
   voice: '语音',
@@ -725,6 +727,7 @@ interface SessionLoadStageState {
 interface SessionLoadTraceState {
   messageCount: SessionLoadStageState
   mediaMetrics: SessionLoadStageState
+  snsPostCounts: SessionLoadStageState
 }
 
 interface SessionLoadStageSummary {
@@ -959,7 +962,8 @@ const createDefaultSessionLoadStage = (): SessionLoadStageState => ({ status: 'p
 
 const createDefaultSessionLoadTrace = (): SessionLoadTraceState => ({
   messageCount: createDefaultSessionLoadStage(),
-  mediaMetrics: createDefaultSessionLoadStage()
+  mediaMetrics: createDefaultSessionLoadStage(),
+  snsPostCounts: createDefaultSessionLoadStage()
 })
 
 const WriteLayoutSelector = memo(function WriteLayoutSelector({
@@ -1419,6 +1423,8 @@ function ExportPage() {
   const sessionSnsTimelinePostsRef = useRef<SnsPost[]>([])
   const sessionSnsTimelineLoadingRef = useRef(false)
   const sessionSnsTimelineRequestTokenRef = useRef(0)
+  const snsUserPostCountsHydrationTokenRef = useRef(0)
+  const snsUserPostCountsBatchTimerRef = useRef<number | null>(null)
   const sessionPreciseRefreshAtRef = useRef<Record<string, number>>({})
   const sessionLoadProgressSnapshotRef = useRef<Record<string, { loaded: number; total: number }>>({})
   const sessionMediaMetricQueueRef = useRef<string[]>([])
@@ -1955,28 +1961,86 @@ function ExportPage() {
     if (snsUserPostCountsStatus === 'loading') return
     if (!options?.force && snsUserPostCountsStatus === 'ready') return
 
+    const targetSessionIds = sessionsRef.current
+      .filter((session) => session.hasSession && isSingleContactSession(session.username))
+      .map((session) => session.username)
+
+    snsUserPostCountsHydrationTokenRef.current += 1
+    const runToken = snsUserPostCountsHydrationTokenRef.current
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+
+    if (targetSessionIds.length === 0) {
+      setSnsUserPostCountsStatus('ready')
+      return
+    }
+
+    patchSessionLoadTraceStage(targetSessionIds, 'snsPostCounts', 'pending', { force: true })
+    patchSessionLoadTraceStage(targetSessionIds, 'snsPostCounts', 'loading')
     setSnsUserPostCountsStatus('loading')
+
+    let normalizedCounts: Record<string, number> = {}
     try {
       const result = await window.electronAPI.sns.getUserPostCounts()
-      if (result.success && result.counts) {
-        const normalized: Record<string, number> = {}
-        for (const [rawUsername, rawCount] of Object.entries(result.counts)) {
-          const username = String(rawUsername || '').trim()
-          if (!username) continue
-          const value = Number(rawCount)
-          normalized[username] = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
-        }
-        setSnsUserPostCounts(normalized)
-        setSnsUserPostCountsStatus('ready')
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+
+      if (!result.success || !result.counts) {
+        patchSessionLoadTraceStage(targetSessionIds, 'snsPostCounts', 'failed', {
+          error: result.error || '朋友圈条数统计失败'
+        })
+        setSnsUserPostCountsStatus('error')
         return
       }
 
-      setSnsUserPostCountsStatus('error')
+      for (const [rawUsername, rawCount] of Object.entries(result.counts)) {
+        const username = String(rawUsername || '').trim()
+        if (!username) continue
+        const value = Number(rawCount)
+        normalizedCounts[username] = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+      }
     } catch (error) {
       console.error('加载朋友圈用户条数失败:', error)
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+      patchSessionLoadTraceStage(targetSessionIds, 'snsPostCounts', 'failed', {
+        error: String(error)
+      })
       setSnsUserPostCountsStatus('error')
+      return
     }
-  }, [snsUserPostCountsStatus])
+
+    let cursor = 0
+    const applyBatch = () => {
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+
+      const batchSessionIds = targetSessionIds.slice(cursor, cursor + SNS_USER_POST_COUNT_BATCH_SIZE)
+      if (batchSessionIds.length === 0) {
+        setSnsUserPostCountsStatus('ready')
+        snsUserPostCountsBatchTimerRef.current = null
+        return
+      }
+
+      const batchCounts: Record<string, number> = {}
+      for (const sessionId of batchSessionIds) {
+        const nextCount = normalizedCounts[sessionId]
+        batchCounts[sessionId] = Number.isFinite(nextCount) ? Math.max(0, Math.floor(nextCount)) : 0
+      }
+
+      setSnsUserPostCounts(prev => ({ ...prev, ...batchCounts }))
+      patchSessionLoadTraceStage(batchSessionIds, 'snsPostCounts', 'done')
+
+      cursor += batchSessionIds.length
+      if (cursor < targetSessionIds.length) {
+        snsUserPostCountsBatchTimerRef.current = window.setTimeout(applyBatch, SNS_USER_POST_COUNT_BATCH_INTERVAL_MS)
+      } else {
+        setSnsUserPostCountsStatus('ready')
+        snsUserPostCountsBatchTimerRef.current = null
+      }
+    }
+
+    applyBatch()
+  }, [patchSessionLoadTraceStage, snsUserPostCountsStatus])
 
   const loadSessionSnsTimelinePosts = useCallback(async (target: SessionSnsTimelineTarget, options?: { reset?: boolean }) => {
     const reset = Boolean(options?.reset)
@@ -2080,7 +2144,7 @@ function ExportPage() {
     }
 
     void loadSessionSnsTimelinePosts(target, { reset: true })
-    void loadSnsUserPostCounts({ force: true })
+    void loadSnsUserPostCounts()
   }, [
     loadSessionSnsTimelinePosts,
     loadSnsUserPostCounts,
@@ -2568,6 +2632,13 @@ function ExportPage() {
     setSessionLoadTraceMap({})
     setSessionLoadProgressPulseMap({})
     sessionLoadProgressSnapshotRef.current = {}
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+    setSnsUserPostCounts({})
+    setSnsUserPostCountsStatus('idle')
     setIsLoadingSessionCounts(false)
     setIsSessionCountStageReady(false)
 
@@ -2895,8 +2966,14 @@ function ExportPage() {
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     sessionLoadTokenRef.current = Date.now()
     sessionCountRequestIdRef.current += 1
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
     setIsSessionEnriching(false)
     setIsLoadingSessionCounts(false)
+    setSnsUserPostCountsStatus('idle')
   }, [isExportRoute])
 
   useEffect(() => {
@@ -4087,18 +4164,31 @@ function ExportPage() {
     }
   }, [getLoadDetailStatusLabel, sessionLoadTraceMap])
 
+  const createNotApplicableLoadSummary = useCallback((): SessionLoadStageSummary => {
+    return {
+      total: 0,
+      loaded: 0,
+      statusLabel: '不适用'
+    }
+  }, [])
+
   const sessionLoadDetailRows = useMemo(() => {
     const tabOrder: ConversationTab[] = ['private', 'group', 'official', 'former_friend']
     return tabOrder.map((tab) => {
       const sessionIds = loadDetailTargetsByTab[tab] || []
+      const snsSessionIds = sessionIds.filter((sessionId) => isSingleContactSession(sessionId))
+      const snsPostCounts = tab === 'private' || tab === 'former_friend'
+        ? summarizeLoadTraceForTab(snsSessionIds, 'snsPostCounts')
+        : createNotApplicableLoadSummary()
       return {
         tab,
         label: conversationTabLabels[tab],
         messageCount: summarizeLoadTraceForTab(sessionIds, 'messageCount'),
-        mediaMetrics: summarizeLoadTraceForTab(sessionIds, 'mediaMetrics')
+        mediaMetrics: summarizeLoadTraceForTab(sessionIds, 'mediaMetrics'),
+        snsPostCounts
       }
     })
-  }, [loadDetailTargetsByTab, summarizeLoadTraceForTab])
+  }, [createNotApplicableLoadSummary, loadDetailTargetsByTab, summarizeLoadTraceForTab])
 
   const formatLoadDetailPulseTime = useCallback((value?: number): string => {
     if (!value || !Number.isFinite(value)) return '--'
@@ -4115,7 +4205,7 @@ function ExportPage() {
     const nextSnapshot: Record<string, { loaded: number; total: number }> = {}
     const resetKeys: string[] = []
     const updates: Array<{ key: string; at: number; delta: number }> = []
-    const stageKeys: Array<keyof SessionLoadTraceState> = ['messageCount', 'mediaMetrics']
+    const stageKeys: Array<keyof SessionLoadTraceState> = ['messageCount', 'mediaMetrics', 'snsPostCounts']
 
     for (const row of sessionLoadDetailRows) {
       for (const stageKey of stageKeys) {
@@ -4255,6 +4345,11 @@ function ExportPage() {
 
   useEffect(() => {
     return () => {
+      snsUserPostCountsHydrationTokenRef.current += 1
+      if (snsUserPostCountsBatchTimerRef.current) {
+        window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+        snsUserPostCountsBatchTimerRef.current = null
+      }
       if (sessionMediaMetricBackgroundFeedTimerRef.current) {
         window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
         sessionMediaMetricBackgroundFeedTimerRef.current = null
@@ -4608,6 +4703,15 @@ function ExportPage() {
   ])
 
   useEffect(() => {
+    if (!isExportRoute || !isSessionCountStageReady) return
+    if (snsUserPostCountsStatus !== 'idle') return
+    const timer = window.setTimeout(() => {
+      void loadSnsUserPostCounts()
+    }, 260)
+    return () => window.clearTimeout(timer)
+  }, [isExportRoute, isSessionCountStageReady, loadSnsUserPostCounts, snsUserPostCountsStatus])
+
+  useEffect(() => {
     if (!sessionSnsTimelineTarget) return
     if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
       setSessionSnsTimelineStatsLoading(true)
@@ -4654,7 +4758,7 @@ function ExportPage() {
     detailStatsPriorityRef.current = true
     setShowSessionDetailPanel(true)
     if (isSingleContactSession(sessionId)) {
-      void loadSnsUserPostCounts({ force: true })
+      void loadSnsUserPostCounts()
     }
     void loadSessionDetail(sessionId)
   }, [loadSessionDetail, loadSnsUserPostCounts])
@@ -4672,6 +4776,9 @@ function ExportPage() {
 
   useEffect(() => {
     if (!showSessionLoadDetailModal) return
+    if (snsUserPostCountsStatus === 'idle') {
+      void loadSnsUserPostCounts()
+    }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         setShowSessionLoadDetailModal(false)
@@ -4679,7 +4786,7 @@ function ExportPage() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [showSessionLoadDetailModal])
+  }, [loadSnsUserPostCounts, showSessionLoadDetailModal, snsUserPostCountsStatus])
 
   useEffect(() => {
     if (!sessionSnsTimelineTarget) return
@@ -4811,7 +4918,8 @@ function ExportPage() {
     for (const row of sessionLoadDetailRows) {
       const candidateTimes = [
         row.messageCount.finishedAt || row.messageCount.startedAt || 0,
-        row.mediaMetrics.finishedAt || row.mediaMetrics.startedAt || 0
+        row.mediaMetrics.finishedAt || row.mediaMetrics.startedAt || 0,
+        row.snsPostCounts.finishedAt || row.snsPostCounts.startedAt || 0
       ]
       for (const candidate of candidateTimes) {
         if (candidate > latest) {
@@ -5427,6 +5535,40 @@ function ExportPage() {
                             </span>
                             <span>{formatLoadDetailTime(row.mediaMetrics.startedAt)}</span>
                             <span>{formatLoadDetailTime(row.mediaMetrics.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>朋友圈条数统计</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows.map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`snsPostCounts:${row.tab}`]
+                        const isLoading = row.snsPostCounts.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`sns-count-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.snsPostCounts.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.snsPostCounts.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.snsPostCounts.finishedAt)}</span>
                           </div>
                         )
                       })}
