@@ -812,8 +812,9 @@ export class KeyService {
       onProgress?.('正在查找模板文件...')
       const { ciphertext, xorKey } = await this._findTemplateData(userDir)
       if (!ciphertext) return { success: false, error: '未找到 V2 模板文件，请先在微信中查看几张图片' }
+      if (xorKey === null) return { success: false, error: '未能从模板文件中计算出有效的 XOR 密钥，请确保在微信中查看了多张不同的图片' }
 
-      onProgress?.(`XOR 密钥: 0x${(xorKey ?? 0).toString(16).padStart(2, '0')}，正在查找微信进程...`)
+      onProgress?.(`XOR 密钥: 0x${xorKey.toString(16).padStart(2, '0')}，正在查找微信进程...`)
 
       // 2. 找微信 PID
       const pid = await this.findWeChatPid()
@@ -830,7 +831,7 @@ export class KeyService {
         const aesKey = await this._scanMemoryForAesKey(pid, ciphertext, onProgress)
         if (aesKey) {
           onProgress?.('密钥获取成功')
-          return { success: true, xorKey: xorKey ?? 0, aesKey }
+          return { success: true, xorKey, aesKey }
         }
         // 等 5 秒再试
         await new Promise(r => setTimeout(r, 5000))
